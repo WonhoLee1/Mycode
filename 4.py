@@ -6,16 +6,13 @@ from numba import njit
 from tqdm import tqdm
 import os
 
-# --- 1. 가속 탐색: 최대한 큰 정수 단위 박스 찾기 ---
+# --- 1. 가속 탐색: 공기 영역 박스 확장 ---
 @njit
-def grow_box_max(grid, start_z, start_y, start_x):
+def grow_box_refined(grid, start_z, start_y, start_x):
     d, h, w = grid.shape
     z1, z2, y1, y2, x1, x2 = start_z, start_z, start_y, start_y, start_x, start_x
-    
     while True:
         expanded = False
-        # 부피를 키우기 위해 각 축 방향으로 확장 시도
-        # (X -> Y -> Z 순차 확장으로 큰 덩어리 유도)
         if x2 + 1 < w and np.all(grid[z1:z2+1, y1:y2+1, x2+1]): x2 += 1; expanded = True
         if x1 - 1 >= 0 and np.all(grid[z1:z2+1, y1:y2+1, x1-1]): x1 -= 1; expanded = True
         if y2 + 1 < h and np.all(grid[z1:z2+1, y2+1, x1:x2+1]): y2 += 1; expanded = True
@@ -25,105 +22,88 @@ def grow_box_max(grid, start_z, start_y, start_x):
         if not expanded: break
     return z1, z2, y1, y2, x1, x2
 
-# --- 2. 하이엔드 최적화 엔진 ---
-class MinCountPrecisionEngine:
-    def __init__(self, mesh_path, resolution=100, min_side=3.0, tolerance=0.05):
+# --- 2. 최적화 엔진 ---
+class FinalMachiningEngine:
+    def __init__(self, mesh_path, resolution=120, min_side=1.0, tolerance=0.01):
         self.mesh = trimesh.load(mesh_path)
         self.mesh.fix_normals()
         
         self.b_min, self.b_max = self.mesh.bounds
         self.base_size = self.b_max - self.b_min
         
-        # 설정 인자
-        self.res = resolution
-        self.min_side = min_side    # 작을수록 정밀하지만 블록 수가 늘어남
-        self.tol = tolerance        # 0.05mm 수준의 정밀 밀착
+        # [정밀도 튜닝 인자]
+        self.res = resolution      # 높을수록 정밀 (100~150 권장)
+        self.min_side = min_side    # 낮을수록 원본에 가까워짐 (1.0~2.0 권장)
+        self.tol = tolerance        # 침투 오차 (0.01mm)
+        
         self.pitch = np.max(self.base_size) / self.res
         self.origin = self.b_min
-        
         self.cutters = []
         self.final_grid = None
 
     def snap_to_surface(self, bounds):
-        """육면체의 각 면을 원본 메쉬 표면에 실시간 피팅 (핵심 로직)"""
+        """박스 면을 소수점 단위로 원본 표면에 밀착"""
         refined = np.array(bounds).copy()
-        # 6개 면을 독립적으로 이동 (xmin, xmax, ymin, ymax, zmin, zmax)
-        for i in range(6):
-            axis = i // 2
-            direction = -1 if i % 2 == 0 else 1
-            
-            # 면의 중심점 샘플링
-            c = [(refined[0]+refined[1])/2, (refined[2]+refined[3])/2, (refined[4]+refined[5])/2]
-            c[axis] = refined[i]
-            
-            # 메쉬 표면까지의 거리 측정 (Signed Distance)
-            # 양수: 외부(공기), 음수: 내부(살)
-            dist = trimesh.proximity.signed_distance(self.mesh, [c])[0]
-            
-            # 면 이동: 표면과의 거리가 tolerance가 되도록 조정
-            # 깎아야 할 공간(공기)을 최대한 확보하면서 살은 건드리지 않음
-            move = -(dist + self.tol) * direction
-            refined[i] += move
-            
+        for _ in range(3):
+            for i in range(6):
+                axis, side = i // 2, (-1 if i % 2 == 0 else 1)
+                c = [(refined[0]+refined[1])/2, (refined[2]+refined[3])/2, (refined[4]+refined[5])/2]
+                c[axis] = refined[i]
+                dist = trimesh.proximity.signed_distance(self.mesh, [c])[0]
+                refined[i] += -(dist + self.tol) * side
         return refined
 
     def run(self):
-        # 초기 공간 분석
+        # 1. 그리드 생성
         dims = np.ceil(self.base_size / self.pitch).astype(int) + 2
         z, y, x = np.indices(dims[::-1])
         pts = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1) * self.pitch + self.origin
         
+        # 2. 볼륨 분석 (Solid 내부 보호)
         inside = self.mesh.contains(pts)
         grid = (~inside).reshape(dims[::-1])
         temp_grid = grid.copy()
         skipping_mask = np.ones_like(temp_grid, dtype=bool)
         
-        print(f"\n[최적화 가동] 블록 수 최소화 & 표면 밀착 모드")
-        with tqdm(total=np.sum(grid), desc="Optimizing Toolpath") as pbar:
+        print(f"\n[시뮬레이션 가동] 해상도: {self.res}, 최소변: {self.min_side}mm")
+        with tqdm(total=np.sum(grid), desc="Removing Volume") as pbar:
             while True:
-                # 1. 남아있는 공기 영역 중 가장 큰 부피의 중심 찾기
                 search = temp_grid & skipping_mask
                 dist_map = distance_transform_edt(search)
                 if dist_map.max() < 0.5: break
                 
                 seed = np.unravel_index(np.argmax(dist_map), search.shape)
+                z1, z2, y1, y2, x1, x2 = grow_box_refined(temp_grid, *seed)
                 
-                # 2. Greedy 확장 (정수 복셀 단위)
-                z1, z2, y1, y2, x1, x2 = grow_box_max(temp_grid, *seed)
-                
-                # 3. 연속 공간 피팅 (소수점 단위 밀착)
+                # 좌표 변환 및 표면 피팅
                 w_min = self.origin + np.array([x1, y1, z1]) * self.pitch
                 w_max = self.origin + np.array([x2+1, y2+1, z2+1]) * self.pitch
                 free_bounds = self.snap_to_surface([w_min[0], w_max[0], w_min[1], w_max[1], w_min[2], w_max[2]])
                 
-                # 4. 크기 제약 확인
-                size = np.array([free_bounds[1]-free_bounds[0], 
-                                 free_bounds[3]-free_bounds[2], 
-                                 free_bounds[5]-free_bounds[4]])
+                size = np.array([free_bounds[1]-free_bounds[0], free_bounds[3]-free_bounds[2], free_bounds[5]-free_bounds[4]])
                 
                 if np.all(size >= self.min_side):
                     self.cutters.append(free_bounds)
-                    # 처리된 영역 그리드에서 제거 (중복 방지)
                     removed = np.sum(temp_grid[z1:z2+1, y1:y2+1, x1:x2+1])
                     temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
                     pbar.update(removed)
                 else:
-                    # 너무 작은 틈새는 Seed에서 제외하여 무한루프 방지
                     skipping_mask[seed] = False
         
         self.final_grid = temp_grid
 
     def visualize(self, mesh_path):
-        p = pv.Plotter(shape=(1, 3), title="Final Manufacturing Report")
+        p = pv.Plotter(shape=(1, 3), title="Final Verification")
         
-        # 1. 목표 형상 (CAD)
+        # 뷰 1: 소재와 원본
         p.subplot(0, 0)
-        p.add_text("1. Target CAD", font_size=10)
-        p.add_mesh(self.mesh, color='white', opacity=0.4)
-        
-        # 2. 최적화된 커터 (최소 개수)
+        p.add_text("1. Base Stock & Target", font_size=10)
+        p.add_mesh(pv.Box(bounds=[self.b_min[0], self.b_max[0], self.b_min[1], self.b_max[1], self.b_min[2], self.b_max[2]]), style='wireframe')
+        p.add_mesh(self.mesh, color='white', opacity=0.3)
+
+        # 뷰 2: 커터 블록 (가공 경로)
         p.subplot(0, 1)
-        p.add_text(f"2. Optimized Cutters: {len(self.cutters)} ea", font_size=10)
+        p.add_text(f"2. {len(self.cutters)} Cutters", font_size=10)
         cutter_mb = pv.MultiBlock()
         for i, b in enumerate(self.cutters):
             box = pv.Box(bounds=b)
@@ -131,32 +111,31 @@ class MinCountPrecisionEngine:
             cutter_mb.append(box)
         p.add_mesh(cutter_mb, scalars="ID", cmap='turbo', show_edges=True, show_scalar_bar=False)
 
-        # 3. 실제 가공 결과 (Subtraction Simulation)
+        # 뷰 3: 실제 가공 결과물 (매우 중요)
         p.subplot(0, 2)
-        p.add_text("3. Simulated Machining Result", font_size=10)
-        # 소재에서 커터를 빼고 남은 '살' 시각화
+        p.add_text("3. Machined Result (Overlap)", font_size=10)
+        # 가공 후 남은 살점 (주황색)
         z, y, x = np.where(~self.final_grid)
         points = np.column_stack([x, y, z]) * self.pitch + self.origin
         if len(points) > 0:
             glyphs = pv.PolyData(points).glyph(geom=pv.Cube(x_length=self.pitch, y_length=self.pitch, z_length=self.pitch))
-            p.add_mesh(glyphs, color='gold', show_edges=False)
+            p.add_mesh(glyphs, color='orange', label="Result")
+        # 원본(반투명 흰색)을 겹쳐서 차이 확인
+        p.add_mesh(self.mesh, color='white', opacity=0.4)
         
-        p.link_views()
-        p.show()
+        p.link_views(); p.show()
 
-# --- 실행부 ---
+# --- 실행 ---
 if __name__ == "__main__":
-    # 고리(Annulus) 형상으로 테스트
-    f_name = 'precision_test.stl'
+    f_name = 'test_model.stl'
     if not os.path.exists(f_name):
         trimesh.creation.annulus(r_min=10, r_max=25, height=15).export(f_name)
 
-    engine = MinCountPrecisionEngine(
+    engine = FinalMachiningEngine(
         mesh_path=f_name,
-        resolution=80,      # 높을수록 정밀하지만 계산량 증가
-        min_side=5.0,       # 이 값을 키우면 블록 수가 획기적으로 줄어듭니다.
-        tolerance=0.05      # 표면 밀착 허용 오차 (mm)
+        resolution=120,   # 세밀한 표현을 위해 120 이상 권장
+        min_side=1.5,     # 원본에 밀착하려면 이 값을 작게(1.0~2.0) 설정하십시오
+        tolerance=0.01
     )
-    
     engine.run()
     engine.visualize(f_name)
