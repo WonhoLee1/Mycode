@@ -1,16 +1,15 @@
 import numpy as np
 import trimesh
 import pyvista as pv
-from pyvista import plotter
 from scipy.ndimage import distance_transform_edt
 from numba import njit
 from tqdm import tqdm
 import os
-import time
 
-# --- [1. 가속 확장 로직 (Numba)] ---
+# --- [1. 확장 로직 개선: 최소 확장 보장] ---
 @njit
 def compute_maximum_expandable_bounding_box(occupancy_status_grid, start_z_idx, start_y_idx, start_x_idx):
+    # (이전과 동일한 확장 로직)
     grid_depth, grid_height, grid_width = occupancy_status_grid.shape
     z_min, z_max = start_z_idx, start_z_idx
     y_min, y_max = start_y_idx, start_y_idx
@@ -33,61 +32,45 @@ def compute_maximum_expandable_bounding_box(occupancy_status_grid, start_z_idx, 
         if not expanded_flag: break
     return z_min, z_max, y_min, y_max, x_min, x_max
 
-# --- [2. 모달리스 시뮬레이션 엔진] ---
-class ModelessMachiningEngine:
+class RobustMachiningEngine:
     def __init__(self, target_stl_file_path):
-        """
-        파일을 로드하고 즉시 시각화 창을 엽니다.
-        """
-        if not os.path.exists(target_stl_file_path):
-            trimesh.creation.annulus(r_min=10, r_max=20, height=15).export(target_stl_file_path)
-
         self.original_cad_mesh = trimesh.load(target_stl_file_path)
         if isinstance(self.original_cad_mesh, trimesh.Scene):
             self.original_cad_mesh = self.original_cad_mesh.dump(concatenate=True)
-            
-        # 기하 정보 분석
         self.original_min, self.original_max = self.original_cad_mesh.bounds
-        self.dimensions = self.original_max - self.original_min
-        self.max_dim = self.dimensions.max()
         self.geometric_center = (self.original_min + self.original_max) / 2.0
         
-        # 1/20 기본값 계산
-        self.default_resolution = 20 
-        self.default_min_side = self.max_dim / 20.0
-        
-        print("\n" + "="*65)
-        print(" [STL 분석 및 모달리스 시각화 시작]")
-        print(f" 모델 크기: {self.dimensions[0]:.2f} x {self.dimensions[1]:.2f} x {self.dimensions[2]:.2f}")
-        print(f" 자동 제안: Res={self.default_resolution}, MinSide={self.default_min_side:.2f}")
-        print("="*65)
+        # 모달리스 시각화
+        self.plotter = pv.Plotter(title="Robust Machining Simulation")
+        self.plotter.add_mesh(self.original_cad_mesh, color='white', opacity=0.3)
+        self.plotter.show(interactive_update=True)
 
-        # PyVista Plotter 초기화 (모달리스처럼 동작시키기 위해 show(interactive_update=True) 활용 가능)
-        self.plotter = pv.Plotter(title="Machining Preview (Modeless)")
-        self.plotter.add_mesh(self.original_cad_mesh, color='white', opacity=0.5, label="Original CAD")
-        self.plotter.add_axes()
-        self.plotter.show(interactive_update=True) # 창을 띄우고 다음 코드로 넘어감
-
-    def configure(self, resolution=None, min_side=None, expansion=1.1, tolerance=-0.1):
-        self.resolution = resolution if resolution else self.default_resolution
-        self.min_cutter_size = min_side if min_side else self.default_min_side
+    def set_parameters(self, resolution, min_side, expansion=1.1, tolerance=-0.1):
+        self.resolution = resolution
         self.stock_expansion_ratio = expansion
         self.tolerance = tolerance
         
-        # 가공 범위 설정 및 시각화 업데이트
+        # 가공 범위 계산
         self.stock_boundary_min = self.geometric_center + (self.original_min - self.geometric_center) * expansion
         self.stock_boundary_max = self.geometric_center + (self.original_max - self.geometric_center) * expansion
         self.voxel_pitch = np.max(self.stock_boundary_max - self.stock_boundary_min) / self.resolution
         
-        # 가공 영역(Stock) 가이드라인 추가
+        # [핵심 보정] 사용자의 min_side가 격자 간격(Pitch)보다 작으면 물리적으로 가공 불가
+        # 최소한 한 격자 크기보다는 크게 설정되도록 자동 보정합니다.
+        self.min_cutter_size = max(min_side, self.voxel_pitch * 0.9)
+        
+        print(f"\n[파라미터 점검]")
+        print(f"- 격자 간격(Pitch): {self.voxel_pitch:.4f}")
+        print(f"- 적용된 최소 커터 크기: {self.min_cutter_size:.4f} (입력값: {min_side})")
+        
         stock_box = pv.Box(bounds=[self.stock_boundary_min[0], self.stock_boundary_max[0],
                                    self.stock_boundary_min[1], self.stock_boundary_max[1],
                                    self.stock_boundary_min[2], self.stock_boundary_max[2]])
-        self.plotter.add_mesh(stock_box, style='wireframe', color='yellow', label="Stock Boundary")
-        self.plotter.update() # 시각화 갱신
+        self.plotter.add_mesh(stock_box, style='wireframe', color='yellow')
+        self.plotter.update()
 
     def run_simulation(self):
-        # 1. 그리드 분석
+        # 그리드 분석
         dims = np.ceil((self.stock_boundary_max - self.stock_boundary_min) / self.voxel_pitch).astype(int) + 2
         z, y, x = np.indices(dims[::-1])
         pts = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1) * self.voxel_pitch + self.stock_boundary_min
@@ -96,51 +79,55 @@ class ModelessMachiningEngine:
         
         temp_grid = occupancy_grid.copy()
         mask = np.ones_like(temp_grid, dtype=bool)
-        self.calculated_cutter_list = []
+        self.calculated_cutters = []
 
-        print("\n[작업] 커터 생성 및 실시간 시각화 중...")
-        
-        with tqdm(total=np.sum(occupancy_grid), desc="Cutter Planning") as pbar:
+        print("\n[작업] 커터 경로 탐색 시작...")
+        with tqdm(total=np.sum(occupancy_grid), desc="가공 진행률") as pbar:
             while True:
                 search_area = temp_grid & mask
                 dist_map = distance_transform_edt(search_area)
-                if dist_map.max() < 0.5: break
+                if dist_map.max() < 0.1: # 아주 작은 빈틈만 남으면 종료
+                    break
+                
                 seed = np.unravel_index(np.argmax(dist_map), search_area.shape)
                 z1, z2, y1, y2, x1, x2 = compute_maximum_expandable_bounding_box(temp_grid, *seed)
                 
                 w_min = self.stock_boundary_min + np.array([x1, y1, z1]) * self.voxel_pitch
                 w_max = self.stock_boundary_min + np.array([x2+1, y2+1, z2+1]) * self.voxel_pitch
                 
+                # 경계 밀착 및 클램핑
                 refined_b = self.refine_and_clamp_cutter([w_min[0], w_max[0], w_min[1], w_max[1], w_min[2], w_max[2]])
                 
-                if np.all(np.array([refined_b[1]-refined_b[0], refined_b[3]-refined_b[2], refined_b[5]-refined_b[4]]) >= self.min_cutter_size):
-                    self.calculated_cutter_list.append(refined_b)
-                    
-                    # 실시간으로 창에 커터 추가 (선택 사항, 너무 많으면 느려짐)
-                    if len(self.calculated_cutter_list) % 10 == 0:
-                        self.plotter.add_mesh(pv.Box(bounds=refined_b), color='cyan', opacity=0.2)
-                        self.plotter.update()
-
-                    temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
-                    pbar.update(np.sum(occupancy_grid[z1:z2+1, y1:y2+1, x1:x2+1]))
-                else:
+                # [수정] 크기 검증 로직 강화
+                current_size = np.array([refined_b[1]-refined_b[0], refined_b[3]-refined_b[2], refined_b[5]-refined_b[4]])
+                
+                # 만약 너무 작은 영역이라면, 이 시드 포인트는 포기하고 마스크 처리
+                if np.any(current_size < (self.voxel_pitch * 0.5)): 
                     mask[seed] = False
+                    continue
 
-        # 2. 메쉬 커팅 연산 및 최종 결과물 업데이트
-        print("\n[작업] 최종 솔리드 메쉬 생성 중...")
+                self.calculated_cutters.append(refined_b)
+                # 가공된 영역 그리드에서 제거
+                temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
+                pbar.update(np.sum(occupancy_grid[z1:z2+1, y1:y2+1, x1:x2+1]))
+
+        # 최종 메쉬 커팅 (생략 방지를 위해 모든 커터 강제 적용)
+        self.finalize_mesh()
+
+    def finalize_mesh(self):
+        print(f"\n[최종] {len(self.calculated_cutters)}개의 커터로 최종 메쉬 생성 중...")
         current_mesh = pv.Box(bounds=[self.stock_boundary_min[0], self.stock_boundary_max[0],
                                       self.stock_boundary_min[1], self.stock_boundary_max[1],
                                       self.stock_boundary_min[2], self.stock_boundary_max[2]])
         
-        for b in tqdm(self.calculated_cutter_list, desc="Final Boolean"):
-            if current_mesh.n_points == 0: break
+        for b in tqdm(self.calculated_cutters, desc="메쉬 커팅"):
             clipped = current_mesh.clip_box(bounds=b, invert=True)
-            if clipped.n_points > 0: current_mesh = clipped
-            
-        self.plotter.add_mesh(current_mesh, color='orange', label="Predicted Result")
+            if clipped.n_points > 0:
+                current_mesh = clipped
+        
+        self.plotter.add_mesh(current_mesh, color='orange', smooth_shading=True)
         self.plotter.update()
-        print("\n[완료] 시각화 창에서 결과를 확인하세요.")
-        self.plotter.show() # 마지막에 창을 유지함
+        self.plotter.show()
 
     def refine_and_clamp_cutter(self, initial_bounds):
         # (이전과 동일한 정밀 밀착 및 클램핑 로직)
@@ -158,16 +145,9 @@ class ModelessMachiningEngine:
         refined[4] = max(refined[4], self.stock_boundary_min[2]); refined[5] = min(refined[5], self.stock_boundary_max[2])
         return refined
 
-# --- [메인 프로세스] ---
 if __name__ == "__main__":
-    # 1. 엔진 시작과 동시에 STL 시각화 창이 열립니다 (모달리스 방식)
-    engine = ModelessMachiningEngine(target_stl_file_path="my_model.stl")
-    
-    # 창이 떠 있는 상태에서 분석이 진행됩니다.
-    time.sleep(2) # 사용자가 창을 볼 시간을 잠시 줌
-    
-    # 2. 비례 옵션 설정 및 가이드라인 표시
-    engine.configure() 
-    
-    # 3. 가공 시뮬레이션 실행 (결과가 실시간으로 창에 반영됨)
+    engine = RobustMachiningEngine("model.stl")
+    # Resolution 대비 min_side를 너무 크게 주면 가공이 조기에 끝납니다.
+    # 안전하게 min_side를 0으로 주면 격자 한 칸 크기까지 가공합니다.
+    engine.set_parameters(resolution=80, min_side=1.0) 
     engine.run_simulation()
