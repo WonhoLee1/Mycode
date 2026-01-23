@@ -1,0 +1,186 @@
+import numpy as np
+import trimesh
+import pyvista as pv
+from scipy.ndimage import distance_transform_edt
+from numba import njit
+from tqdm import tqdm
+import os
+
+# --- 1. Numba 가속: 그리드 내 박스 확장 로직 ---
+@njit
+def grow_box_conservative(grid, start_z, start_y, start_x):
+    """
+    주어진 시작점(Seed)에서 장애물(Solid)을 만나기 전까지 
+    공기(True) 영역으로만 최대한 확장하는 직육면체를 계산합니다.
+    """
+    d, h, w = grid.shape
+    z1, z2 = start_z, start_z
+    y1, y2 = start_y, start_y
+    x1, x2 = start_x, start_x
+    
+    while True:
+        expanded = False
+        # X축 확장 시도
+        if x2 + 1 < w and np.all(grid[z1:z2+1, y1:y2+1, x2+1]):
+            x2 += 1; expanded = True
+        if x1 - 1 >= 0 and np.all(grid[z1:z2+1, y1:y2+1, x1-1]):
+            x1 -= 1; expanded = True
+        # Y축 확장 시도
+        if y2 + 1 < h and np.all(grid[z1:z2+1, y2+1, x1:x2+1]):
+            y2 += 1; expanded = True
+        if y1 - 1 >= 0 and np.all(grid[z1:z2+1, y1-1, x1:x2+1]):
+            y1 -= 1; expanded = True
+        # Z축 확장 시도
+        if z2 + 1 < d and np.all(grid[z2+1, y1:y2+1, x1:x2+1]):
+            z2 += 1; expanded = True
+        if z1 - 1 >= 0 and np.all(grid[z1-1, y1:y2+1, x1:x2+1]):
+            z1 -= 1; expanded = True
+            
+        if not expanded:
+            break
+    return z1, z2, y1, y2, x1, x2
+
+# --- 2. 커팅 보정 함수: 원본 침범 시 크기 축소 ---
+def refine_cutter_safely(mesh, center, size, steps=5):
+    """
+    커터가 메쉬 내부(Solid)를 과도하게 침범했는지 확인하고, 
+    침범 시 크기를 미세하게 줄여 원본 살을 보호합니다.
+    """
+    curr_size = np.array(size)
+    for _ in range(steps):
+        # 15개 샘플링 포인트 (중심, 8개 꼭짓점, 6개 면 중심)
+        offsets = np.array([[0,0,0], [1,1,1], [1,1,-1], [1,-1,1], [1,-1,-1],
+                            [-1,1,1], [-1,1,-1], [-1,-1,1], [-1,-1,-1],
+                            [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]])
+        # 98% 크기로 검사하여 수치 오차로 인한 불필요한 축소 방지
+        pts = center + (offsets * curr_size * 0.5 * 0.98)
+        if np.any(mesh.contains(pts)):
+            curr_size *= 0.95 # 침범 시 5%씩 축소
+        else:
+            break
+    return curr_size
+
+# --- 3. 메인 프로세서 클래스 ---
+class SubtractiveEngine:
+    def __init__(self, mesh_path, resolution=80):
+        if not os.path.exists(mesh_path):
+            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {mesh_path}")
+            
+        self.mesh = trimesh.load(mesh_path)
+        if not self.mesh.is_watertight:
+            self.mesh.fill_holes()
+            
+        # [원본 바운딩 박스 추출]
+        self.b_min, self.b_max = self.mesh.bounds
+        self.base_center = (self.b_min + self.b_max) / 2
+        self.base_size = self.b_max - self.b_min
+        
+        self.res = resolution
+        self.pitch = np.max(self.base_size) / self.res
+        self.origin = self.b_min
+        self.cutters = []
+
+    def run(self):
+        # 1. 그리드 초기화 (Z, Y, X 순서)
+        dims = np.ceil(self.base_size / self.pitch).astype(int)
+        grid = np.ones(dims[::-1], dtype=bool) 
+        
+        # 2. 메쉬 복셀화 및 안전 마진 적용
+        print(f"공간 분석 중... (해상도: {dims})")
+        vox = self.mesh.voxelized(pitch=self.pitch)
+        v_idx = ((vox.points - self.origin) / self.pitch).astype(int)
+        
+        # 표면 보호를 위한 1복셀 마진 적용
+        for dz in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    s_idx = v_idx + [dx, dy, dz]
+                    vld = (s_idx[:,0]>=0) & (s_idx[:,0]<dims[0]) & \
+                          (s_idx[:,1]>=0) & (s_idx[:,1]<dims[1]) & \
+                          (s_idx[:,2]>=0) & (s_idx[:,2]<dims[2])
+                    grid[s_idx[vld, 2], s_idx[vld, 1], s_idx[vld, 0]] = False
+
+        temp_grid = grid.copy()
+        print("최적 커터 생성 및 실시간 보정 중...")
+        
+        # 3. Greedy 탐색 및 확장
+        with tqdm(desc="Processing Blocks") as pbar:
+            while True:
+                # 거리 변환으로 가장 넓은 빈 공간 탐색
+                dist = distance_transform_edt(temp_grid)
+                if dist.max() < 1.0: break
+                
+                seed = np.unravel_index(np.argmax(dist), temp_grid.shape)
+                z1, z2, y1, y2, x1, x2 = grow_box_conservative(temp_grid, *seed)
+                
+                # 월드 좌표 변환
+                w_min = self.origin + np.array([x1, y1, z1]) * self.pitch
+                w_max = self.origin + np.array([x2+1, y2+1, z2+1]) * self.pitch
+                c = (w_min + w_max) / 2
+                s = (w_max - w_min)
+                
+                # [과도한 커팅 방지 보정]
+                safe_s = refine_cutter_safely(self.mesh, c, s)
+                self.cutters.append({'center': c, 'size': safe_s})
+                
+                # 처리된 영역 마킹
+                temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
+                pbar.update(1)
+
+    def visualize(self, mesh_path):
+        """별도 창 및 분할 뷰 시각화"""
+        p = pv.Plotter(shape=(1, 2), title="Subtractive Analysis: Original vs Cutters")
+        
+        # 뷰 1: 원본 CAD와 베이스 박스 정렬 상태
+        p.subplot(0, 0)
+        p.add_text("1. Base Block & Original Alignment", font_size=10)
+        base_b = [self.b_min[0], self.b_max[0], self.b_min[1], self.b_max[1], self.b_min[2], self.b_max[2]]
+        p.add_mesh(pv.Box(bounds=base_b), color='gray', style='wireframe', line_width=2, label="Base Stock")
+        p.add_mesh(pv.read(mesh_path), color='white', opacity=0.4, label="Original CAD")
+        p.add_legend()
+
+        # 뷰 2: 불투명 커터 블록 (컬러맵 적용)
+        p.subplot(0, 1)
+        p.add_text("2. Non-Transparent Cutters (Individual Colors)", font_size=10)
+        
+        cutter_meshes = pv.MultiBlock()
+        for d in self.cutters:
+            c, s = d['center'], d['size']
+            # bounds = [xmin, xmax, ymin, ymax, zmin, zmax]
+            b_cut = [c[0]-s[0]/2, c[0]+s[0]/2, 
+                     c[1]-s[1]/2, c[1]+s[1]/2, 
+                     c[2]-s[2]/2, c[2]+s[2]/2]
+            cutter_meshes.append(pv.Box(bounds=b_cut))
+        
+        # 컬러맵 적용: 각 블록에 ID 스칼라 부여
+        scalars = np.arange(len(cutter_meshes))
+        p.add_mesh(cutter_meshes, scalars=scalars, cmap='turbo', opacity=1.0, show_edges=True, show_scalar_bar=False)
+        
+        p.link_views()
+        p.camera_position = 'iso'
+        p.show()
+
+# --- 4. 실행부 ---
+if __name__ == "__main__":
+    # 샘플 파일 생성 (파일이 없을 경우 대비)
+    input_file = 'cushion_final.stl'
+    if not os.path.exists(input_file):
+        print("샘플 메쉬를 생성합니다...")
+        sample = trimesh.creation.annulus(r_min=10, r_max=25, height=12)
+        sample.export(input_file)
+
+    # 엔진 초기화 (resolution을 높이면 더 정교해집니다)
+    engine = SubtractiveEngine(input_file, resolution=80)
+    
+    # 처리 시작
+    engine.run()
+    
+    # 최종 결과 데이터 출력
+    print(f"\n--- 최종 처리 결과 ---")
+    print(f"Base Block 위치 (Center): {engine.base_center}")
+    print(f"Base Block 크기 (Size):   {engine.base_size}")
+    print(f"총 커터 블록 수: {len(engine.cutters)}")
+    print(f"----------------------\n")
+
+    # 시각화 실행
+    engine.visualize(input_file)
