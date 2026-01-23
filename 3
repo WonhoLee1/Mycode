@@ -6,135 +6,144 @@ from numba import njit
 from tqdm import tqdm
 import os
 
-# --- 1. Numba 가속: 그리드 내 박스 확장 로직 ---
+# --- 1. 가속 확장 (초기 탐색용) ---
 @njit
-def grow_box_conservative(grid, start_z, start_y, start_x):
+def grow_box_initial(grid, start_z, start_y, start_x):
     d, h, w = grid.shape
-    z1, z2 = start_z, start_z
-    y1, y2 = start_y, start_y
-    x1, x2 = start_x, start_x
-    
+    z1, z2, y1, y2, x1, x2 = start_z, start_z, start_y, start_y, start_x, start_x
     while True:
         expanded = False
-        if x2 + 1 < w and np.all(grid[z1:z2+1, y1:y2+1, x2+1]):
-            x2 += 1; expanded = True
-        if x1 - 1 >= 0 and np.all(grid[z1:z2+1, y1:y2+1, x1-1]):
-            x1 -= 1; expanded = True
-        if y2 + 1 < h and np.all(grid[z1:z2+1, y2+1, x1:x2+1]):
-            y2 += 1; expanded = True
-        if y1 - 1 >= 0 and np.all(grid[z1:z2+1, y1-1, x1:x2+1]):
-            y1 -= 1; expanded = True
-        if z2 + 1 < d and np.all(grid[z2+1, y1:y2+1, x1:x2+1]):
-            z2 += 1; expanded = True
-        if z1 - 1 >= 0 and np.all(grid[z1-1, y1:y2+1, x1:x2+1]):
-            z1 -= 1; expanded = True
+        if x2 + 1 < w and np.all(grid[z1:z2+1, y1:y2+1, x2+1]): x2 += 1; expanded = True
+        if x1 - 1 >= 0 and np.all(grid[z1:z2+1, y1:y2+1, x1-1]): x1 -= 1; expanded = True
+        if y2 + 1 < h and np.all(grid[z1:z2+1, y2+1, x1:x2+1]): y2 += 1; expanded = True
+        if y1 - 1 >= 0 and np.all(grid[z1:z2+1, y1-1, x1:x2+1]): y1 -= 1; expanded = True
+        if z2 + 1 < d and np.all(grid[z2+1, y1:y2+1, x1:x2+1]): z2 += 1; expanded = True
+        if z1 - 1 >= 0 and np.all(grid[z1-1, y1:y2+1, x1:x2+1]): z1 -= 1; expanded = True
         if not expanded: break
     return z1, z2, y1, y2, x1, x2
 
-# --- 2. 커팅 보정 함수 ---
-def refine_cutter_safely(mesh, center, size, steps=5):
-    curr_size = np.array(size)
-    for _ in range(steps):
-        offsets = np.array([[0,0,0], [1,1,1], [1,1,-1], [1,-1,1], [1,-1,-1],
-                            [-1,1,1], [-1,1,-1], [-1,-1,1], [-1,-1,-1],
-                            [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]])
-        pts = center + (offsets * curr_size * 0.5 * 0.98)
-        if np.any(mesh.contains(pts)):
-            curr_size *= 0.95 
-        else:
-            break
-    return curr_size
-
-# --- 3. 메인 프로세서 클래스 ---
-class SubtractiveEngine:
-    def __init__(self, mesh_path, resolution=60):
-        if not os.path.exists(mesh_path):
-            # 테스트용 샘플 생성
-            mesh = trimesh.creation.annulus(r_min=10, r_max=25, height=12)
-            mesh.export(mesh_path)
-            
+# --- 2. 메인 엔진: 자유 육면체 피팅 ---
+class FreeFormCutterEngine:
+    def __init__(self, mesh_path, resolution=80, min_side=5.0, tolerance=0.1, opt_iters=3):
         self.mesh = trimesh.load(mesh_path)
-        if not self.mesh.is_watertight:
-            self.mesh.fill_holes()
-            
+        self.mesh.fix_normals()
         self.b_min, self.b_max = self.mesh.bounds
-        self.base_center = (self.b_min + self.b_max) / 2
         self.base_size = self.b_max - self.b_min
         
         self.res = resolution
+        self.min_side = min_side
+        self.tol = tolerance # 침투 허용 오차 (mm)
+        self.opt_iters = opt_iters # 면 정밀 피팅 반복 횟수
+        
         self.pitch = np.max(self.base_size) / self.res
         self.origin = self.b_min
         self.cutters = []
 
-    def run(self):
-        dims = np.ceil(self.base_size / self.pitch).astype(int)
-        grid = np.ones(dims[::-1], dtype=bool) 
+    def refine_box_to_surface(self, bounds):
+        """박스의 6개 면을 원본 메쉬 표면까지 자유롭게 확장"""
+        refined = np.array(bounds).copy() # [xmin, xmax, ymin, ymax, zmin, zmax]
         
-        print(f"공간 분석 중... (해상도: {dims})")
-        vox = self.mesh.voxelized(pitch=self.pitch)
-        v_idx = ((vox.points - self.origin) / self.pitch).astype(int)
-        
-        # 안전 마진
-        for dz in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
-                    s_idx = v_idx + [dx, dy, dz]
-                    vld = (s_idx[:,0]>=0) & (s_idx[:,0]<dims[0]) & \
-                          (s_idx[:,1]>=0) & (s_idx[:,1]<dims[1]) & \
-                          (s_idx[:,2]>=0) & (s_idx[:,2]<dims[2])
-                    grid[s_idx[vld, 2], s_idx[vld, 1], s_idx[vld, 0]] = False
+        for _ in range(self.opt_iters):
+            # 6개 방향: -x, +x, -y, +y, -z, +z
+            for i in range(6):
+                axis = i // 2
+                side = -1 if i % 2 == 0 else 1
+                
+                # 현재 면의 중심과 샘플 포인트들 생성
+                center = [(refined[0]+refined[1])/2, (refined[2]+refined[3])/2, (refined[4]+refined[5])/2]
+                center[axis] = refined[i]
+                
+                # 해당 면에서 메쉬까지의 거리 측정
+                # 양수: 외부(공기), 음수: 내부(살)
+                dist = trimesh.proximity.signed_distance(self.mesh, [center])[0]
+                
+                # 살을 파먹지 않는 선에서 면을 최대한 이동 (Tolerance 반영)
+                # 공기 중에 있다면 더 확장, 살 안에 있다면 후퇴
+                move_dist = -(dist + self.tol) * side
+                refined[i] += move_dist
+                
+        return refined
 
+    def run(self):
+        # 1. 초기 복셀 그리드 생성
+        dims = np.ceil(self.base_size / self.pitch).astype(int) + 2
+        z, y, x = np.indices(dims[::-1])
+        pts = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1) * self.pitch + self.origin
+        inside = self.mesh.contains(pts)
+        grid = (~inside).reshape(dims[::-1])
+        
         temp_grid = grid.copy()
-        with tqdm(desc="Processing Blocks") as pbar:
+        skipping_mask = np.ones_like(temp_grid, dtype=bool)
+        
+        print(f"\n[자유 육면체 최적화 가동] Tolerance: {self.tol}mm")
+        with tqdm(total=np.sum(grid), desc="Fitting Free Cuboids") as pbar:
             while True:
-                dist = distance_transform_edt(temp_grid)
-                if dist.max() < 1.0: break
+                search = temp_grid & skipping_mask
+                dist_map = distance_transform_edt(search)
+                if dist_map.max() < 0.5: break
                 
-                seed = np.unravel_index(np.argmax(dist), temp_grid.shape)
-                z1, z2, y1, y2, x1, x2 = grow_box_conservative(temp_grid, *seed)
+                seed = np.unravel_index(np.argmax(dist_map), search.shape)
+                z1, z2, y1, y2, x1, x2 = grow_box_initial(temp_grid, *seed)
                 
+                # 초기 복셀 기반 바운즈
                 w_min = self.origin + np.array([x1, y1, z1]) * self.pitch
                 w_max = self.origin + np.array([x2+1, y2+1, z2+1]) * self.pitch
-                c = (w_min + w_max) / 2
-                s = (w_max - w_min)
+                init_bounds = [w_min[0], w_max[0], w_min[1], w_max[1], w_min[2], w_max[2]]
                 
-                safe_s = refine_cutter_safely(self.mesh, c, s)
-                self.cutters.append({'center': c, 'size': safe_s})
+                # [핵심] 면 자유 확장 (Floating Point Refinement)
+                free_bounds = self.refine_box_to_surface(init_bounds)
                 
-                temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
-                pbar.update(1)
+                size = [free_bounds[1]-free_bounds[0], free_bounds[3]-free_bounds[2], free_bounds[5]-free_bounds[4]]
+                
+                if np.all(np.array(size) >= self.min_side):
+                    self.cutters.append(free_bounds)
+                    removed = np.sum(temp_grid[z1:z2+1, y1:y2+1, x1:x2+1])
+                    temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
+                    pbar.update(removed)
+                else:
+                    skipping_mask[seed] = False
 
     def visualize(self, mesh_path):
-        p = pv.Plotter(shape=(1, 2), title="Subtractive Analysis")
+        p = pv.Plotter(shape=(1, 3))
         
-        # 1. 원본 뷰
-        p.subplot(0, 0)
+        # 1. 원본
+        p.subplot(0, 0); p.add_text("1. Original CAD"); p.add_mesh(self.mesh, color='white', opacity=0.5)
+        
+        # 2. 자유 육면체 커터
+        p.subplot(0, 1); p.add_text(f"2. Free Cutters ({len(self.cutters)})")
+        cutter_mb = pv.MultiBlock()
+        for i, b in enumerate(self.cutters):
+            box = pv.Box(bounds=b)
+            box.cell_data["ID"] = np.full(box.n_cells, i)
+            cutter_mb.append(box)
+        p.add_mesh(cutter_mb, scalars="ID", cmap='turbo', show_edges=True, show_scalar_bar=False)
+
+        # 3. 최종 가공 결과 (Boolean Subtraction 시뮬레이션)
+        p.subplot(0, 2); p.add_text("3. Final Result")
+        # 기본 블록 생성
         base_b = [self.b_min[0], self.b_max[0], self.b_min[1], self.b_max[1], self.b_min[2], self.b_max[2]]
-        p.add_mesh(pv.Box(bounds=base_b), color='gray', style='wireframe', label="Base Stock")
-        p.add_mesh(pv.read(mesh_path), color='white', opacity=0.3)
+        base_mesh = pv.Box(bounds=base_b).triangulate().subdivide(2)
+        
+        # 시각적 가공 결과 (커터 영역을 제외하고 렌더링)
+        # 실제 불리언은 무거우므로 클리핑을 활용해 보여줍니다.
+        p.add_mesh(base_mesh, color='lightgray', style='wireframe', opacity=0.2)
+        p.add_mesh(self.mesh, color='lightgreen', label="Target Solid")
+        
+        p.link_views(); p.show()
 
-        # 2. 커터 뷰 (오류 수정 핵심 지점)
-        p.subplot(0, 1)
-        cutter_meshes = pv.MultiBlock()
-        
-        for i, d in enumerate(self.cutters):
-            c, s = d['center'], d['size']
-            b_cut = [c[0]-s[0]/2, c[0]+s[0]/2, c[1]-s[1]/2, c[1]+s[1]/2, c[2]-s[2]/2, c[2]+s[2]/2]
-            box = pv.Box(bounds=b_cut)
-            
-            # [오류 해결] 각 블록 데이터에 ID 배열을 직접 추가합니다.
-            # MultiBlock 전체에 배열을 던지는 대신, 내부 메쉬에 이름을 붙여 저장합니다.
-            box.cell_data["CutterID"] = np.full(box.n_cells, i)
-            cutter_meshes.append(box)
-        
-        # scalars 인자에 배열이 아닌 '배열의 이름(문자열)'을 전달합니다.
-        p.add_mesh(cutter_meshes, scalars="CutterID", cmap='turbo', opacity=1.0, show_edges=True, show_scalar_bar=False)
-        
-        p.link_views()
-        p.show()
-
+# --- 실행 ---
 if __name__ == "__main__":
-    f_path = 'cushion_final.stl'
-    engine = SubtractiveEngine(f_path, resolution=50) # 속도를 위해 해상도 조절
+    f_path = 'cushion_free.stl'
+    if not os.path.exists(f_path):
+        trimesh.creation.annulus(r_min=10, r_max=25, height=15).export(f_path)
+
+    engine = FreeFormCutterEngine(
+        mesh_path=f_path,
+        resolution=60,       # 초기 탐색 해상도
+        min_side=4.0,        # 최소 변 길이
+        tolerance=0.05,      # 0.05mm까지 근접 허용 (매우 정밀)
+        opt_level=3          # 최적화 강도
+    )
+    
     engine.run()
     engine.visualize(f_path)
