@@ -7,7 +7,7 @@ from tqdm import tqdm
 import os
 import time
 
-# --- 1. 가속 확장 로직 (Numba 가속) ---
+# --- 1. 가속 확장 로직 (Numba) ---
 @njit
 def grow_box_fast(grid, start_z, start_y, start_x):
     d, h, w = grid.shape
@@ -25,7 +25,7 @@ def grow_box_fast(grid, start_z, start_y, start_x):
 
 # --- 2. 통합 제어 엔진 ---
 class UltimateCutterEngine:
-    def __init__(self, mesh_path, resolution=100, min_side=2.5, boundary_scale=1.1):
+    def __init__(self, mesh_path, resolution=100, min_side=2.5, boundary_scale=1.1, tolerance=0.0):
         self.mesh = trimesh.load(mesh_path)
         self.mesh.fix_normals()
         
@@ -36,29 +36,41 @@ class UltimateCutterEngine:
         
         self.res = resolution
         self.min_side = min_side
+        self.tol = tolerance  # 음수: 침투(더 깎음), 양수: 오프셋(살 남김)
         self.pitch = np.max(self.work_max - self.work_min) / self.res
         self.origin = self.work_min
         
         self.cutters = []
         self.final_grid = None
 
+    def snap_to_surface(self, bounds):
+        """[핵심] 박스의 6개 면을 표면으로부터 tolerance 만큼 정밀 이동"""
+        refined = np.array(bounds).copy()
+        # x_min, x_max, y_min, y_max, z_min, z_max 순서
+        for _ in range(2): # 2회 반복으로 정밀도 향상
+            for i in range(6):
+                axis = i // 2
+                direction = -1 if i % 2 == 0 else 1
+                
+                # 면의 중심 샘플링
+                c = [(refined[0]+refined[1])/2, (refined[2]+refined[3])/2, (refined[4]+refined[5])/2]
+                c[axis] = refined[i]
+                
+                # 원본과의 거리 측정
+                dist = trimesh.proximity.signed_distance(self.mesh, [c])[0]
+                
+                # 톨러런스를 적용하여 면 이동
+                # tol이 -0.1이면 실제 표면보다 0.1mm 더 안쪽으로 이동(침투)
+                move = -(dist + self.tol) * direction
+                refined[i] += move
+        return refined
+
     def get_rms_error(self, current_grid):
-        """가공물과 원본 사이의 RMS 오차 산출"""
         z, y, x = np.where(~current_grid)
         if len(x) == 0: return 0.0
         pts = np.column_stack([x, y, z]) * self.pitch + self.origin
         dists = trimesh.proximity.closest_point(self.mesh, pts)[1]
         return np.sqrt(np.mean(dists**2))
-
-    def merge_overlapping_cutters(self):
-        """완전히 포함된 블록 제거 최적화"""
-        if not self.cutters: return
-        self.cutters.sort(key=lambda b: (b[1]-b[0])*(b[3]-b[2])*(b[5]-b[4]), reverse=True)
-        refined = []
-        for c in self.cutters:
-            is_inside = any(c[0]>=r[0] and c[1]<=r[1] and c[2]>=r[2] and c[3]<=r[3] and c[4]>=r[4] and c[5]<=r[5] for r in refined)
-            if not is_inside: refined.append(c)
-        self.cutters = refined
 
     def run(self):
         # 그리드 초기화
@@ -71,90 +83,72 @@ class UltimateCutterEngine:
         skipping_mask = np.ones_like(temp_grid, dtype=bool)
         total_air = np.sum(grid)
         
-        print(f"\n[작업 시작] 해상도:{self.res}, 최소변:{self.min_side}mm, 범위:110%")
-        print(f"[정보] 분석 대상 복셀 수: {total_air:,}개")
+        print(f"\n[작업 시작] 톨러런스: {self.tol}mm (음수:침투, 양수:오프셋)")
         print("-" * 70)
 
-        start_time = time.time()
         with tqdm(total=total_air, desc="가공 진행률", unit="vx") as pbar:
             while True:
-                # 1. 잔여 공간 탐색
                 search = temp_grid & skipping_mask
                 dist_map = distance_transform_edt(search)
-                max_d = dist_map.max()
-                
-                if max_d < 0.5:
-                    tqdm.write("\n[이벤트] 잔여 공간이 해상도 미만입니다. 가공을 종료합니다.")
-                    break
+                if dist_map.max() < 0.5: break
                 
                 seed = np.unravel_index(np.argmax(dist_map), search.shape)
                 z1, z2, y1, y2, x1, x2 = grow_box_fast(temp_grid, *seed)
                 
-                # 2. 크기 제약 검사
-                size = np.array([x2-x1+1, y2-y1+1, z2-z1+1]) * self.pitch
+                # 1. 초기 월드 좌표 바운즈 생성
+                w_min = self.origin + np.array([x1, y1, z1]) * self.pitch
+                w_max = self.origin + np.array([x2+1, y2+1, z2+1]) * self.pitch
+                initial_bounds = [w_min[0], w_max[0], w_min[1], w_max[1], w_min[2], w_max[2]]
+                
+                # 2. 표면 정밀 밀착 및 톨러런스 적용 (침투/오프셋)
+                refined_bounds = self.snap_to_surface(initial_bounds)
+                
+                # 3. 크기 제약 검사
+                size = np.array([refined_bounds[1]-refined_bounds[0], 
+                                 refined_bounds[3]-refined_bounds[2], 
+                                 refined_bounds[5]-refined_bounds[4]])
                 
                 if np.all(size >= self.min_side):
-                    # 블록 확정
-                    b = [self.origin[0]+x1*self.pitch, self.origin[0]+(x2+1)*self.pitch,
-                         self.origin[1]+y1*self.pitch, self.origin[1]+(y2+1)*self.pitch,
-                         self.origin[2]+z1*self.pitch, self.origin[2]+(z2+1)*self.pitch]
-                    self.cutters.append(b)
-                    
+                    self.cutters.append(refined_bounds)
                     removed = np.sum(temp_grid[z1:z2+1, y1:y2+1, x1:x2+1])
                     temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
                     pbar.update(removed)
                     
-                    # 주기적 로그 (50개 블록 단위)
                     if len(self.cutters) % 50 == 0:
                         rms = self.get_rms_error(temp_grid)
-                        tqdm.write(f" > Block #{len(self.cutters):<4} | 제거율: {pbar.n/total_air*100:4.1f}% | RMS 오차: {rms:.4f}mm")
+                        tqdm.write(f" > Block #{len(self.cutters):<4} | 오차: {rms:.4f}mm")
                 else:
-                    # [정체 발생 지점] min_side 제약에 걸린 경우 mask 처리하여 다음 탐색에서 제외
                     skipping_mask[seed] = False
-                    # 78% 정체 구간에서 어떤 일이 벌어지는지 알리기 위함
-                    if np.random.rand() < 0.01: # 너무 자주 뜨지 않게 조절
-                        tqdm.write(f" [분석] 좁은 틈새({size.max():.2f}mm) 발견 - 제약조건 미달로 우회 중...")
 
-        # 3. 마무리 최적화
-        print("-" * 70)
-        print("[처리 중] 중복 커터 제거 및 데이터 통합...")
-        before = len(self.cutters)
-        self.merge_overlapping_cutters()
-        
         self.final_grid = temp_grid
-        elapsed = time.time() - start_time
-        print(f"[완료] 소요시간: {elapsed:.1f}s | 최종 블록: {before}->{len(self.cutters)}개 | 최종 오차: {self.get_rms_error(temp_grid):.4f}mm")
 
     def visualize(self, mesh_path):
-        p = pv.Plotter(shape=(1, 2), title="Machining Analysis Report")
-        
-        # 좌측: 커터 블록 (가공 경로)
+        p = pv.Plotter(shape=(1, 2))
         p.subplot(0, 0)
-        p.add_text("1. Optimized Cutter Path", font_size=10)
-        if self.cutters:
-            boxes = pv.MultiBlock([pv.Box(bounds=b) for b in self.cutters])
-            p.add_mesh(boxes, color='cyan', show_edges=True, opacity=0.6, label="Cutters")
+        p.add_text(f"Cutters (Tol: {self.tol}mm)")
+        boxes = pv.MultiBlock([pv.Box(bounds=b) for b in self.cutters])
+        p.add_mesh(boxes, color='cyan', show_edges=True, opacity=0.5)
         p.add_mesh(self.mesh, color='white', opacity=0.2)
 
-        # 우측: 실제 최종 형상 (Base - Cutters)
         p.subplot(0, 1)
-        p.add_text("2. Final Result vs Target", font_size=10)
+        p.add_text("Final Machined Shape")
         z, y, x = np.where(~self.final_grid)
         pts = np.column_stack([x, y, z]) * self.pitch + self.origin
         if len(pts) > 0:
-            res_mesh = pv.PolyData(pts).glyph(geom=pv.Cube(x_length=self.pitch, y_length=self.pitch, z_length=self.pitch))
-            p.add_mesh(res_mesh, color='orange', label="Actual Shape")
-        p.add_mesh(self.mesh, color='white', opacity=0.3, label="Target CAD")
-        
+            glyphs = pv.PolyData(pts).glyph(geom=pv.Cube(x_length=self.pitch, y_length=self.pitch, z_length=self.pitch))
+            p.add_mesh(glyphs, color='orange')
+        p.add_mesh(self.mesh, color='white', opacity=0.3)
         p.link_views(); p.show()
 
 # --- 실행부 ---
 if __name__ == "__main__":
-    f_path = 'precision_model.stl'
+    f_path = 'model.stl'
     if not os.path.exists(f_path):
         trimesh.creation.annulus(r_min=10, r_max=25, height=15).export(f_path)
 
-    # 78% 정체가 심하다면 resolution을 약간 낮추거나 min_side를 높여보세요.
-    engine = UltimateCutterEngine(mesh_path=f_path, resolution=80, min_side=2.0)
+    # 설정 예시:
+    # tolerance = -0.15  => 실제 면보다 0.15mm 더 파고듬 (침투)
+    # tolerance = 0.5    => 실제 면보다 0.5mm 덜 깎음 (오프셋/살 남기기)
+    engine = UltimateCutterEngine(mesh_path=f_path, resolution=80, min_side=2.0, tolerance=-0.1)
     engine.run()
     engine.visualize(f_path)
