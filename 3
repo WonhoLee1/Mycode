@@ -104,4 +104,37 @@ class SubtractiveEngine:
                 temp_grid[z1:z2+1, y1:y2+1, x1:x2+1] = False
                 pbar.update(1)
 
-    def visualize(self, mesh
+    def visualize(self, mesh_path):
+        p = pv.Plotter(shape=(1, 2), title="Subtractive Analysis")
+        
+        # 1. 원본 뷰
+        p.subplot(0, 0)
+        base_b = [self.b_min[0], self.b_max[0], self.b_min[1], self.b_max[1], self.b_min[2], self.b_max[2]]
+        p.add_mesh(pv.Box(bounds=base_b), color='gray', style='wireframe', label="Base Stock")
+        p.add_mesh(pv.read(mesh_path), color='white', opacity=0.3)
+
+        # 2. 커터 뷰 (오류 수정 핵심 지점)
+        p.subplot(0, 1)
+        cutter_meshes = pv.MultiBlock()
+        
+        for i, d in enumerate(self.cutters):
+            c, s = d['center'], d['size']
+            b_cut = [c[0]-s[0]/2, c[0]+s[0]/2, c[1]-s[1]/2, c[1]+s[1]/2, c[2]-s[2]/2, c[2]+s[2]/2]
+            box = pv.Box(bounds=b_cut)
+            
+            # [오류 해결] 각 블록 데이터에 ID 배열을 직접 추가합니다.
+            # MultiBlock 전체에 배열을 던지는 대신, 내부 메쉬에 이름을 붙여 저장합니다.
+            box.cell_data["CutterID"] = np.full(box.n_cells, i)
+            cutter_meshes.append(box)
+        
+        # scalars 인자에 배열이 아닌 '배열의 이름(문자열)'을 전달합니다.
+        p.add_mesh(cutter_meshes, scalars="CutterID", cmap='turbo', opacity=1.0, show_edges=True, show_scalar_bar=False)
+        
+        p.link_views()
+        p.show()
+
+if __name__ == "__main__":
+    f_path = 'cushion_final.stl'
+    engine = SubtractiveEngine(f_path, resolution=50) # 속도를 위해 해상도 조절
+    engine.run()
+    engine.visualize(f_path)
