@@ -183,3 +183,106 @@ print(f"- 자유 낙하: {abs(c0['v'][-1]):.2f} mm/s")
 print(f"- 풀 모델 적용: {abs(c2['v'][-1]):.2f} mm/s")
 
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 1. 물리 상수 및 환경 설정 (mm, tonne, s)
+L, W = 2000.0, 1200.0           # 상자 크기 (mm)
+A = L * W                       # 바닥 면적 (mm^2)
+P = 2 * (L + W)                 # 상자 둘레 (mm)
+mass = 0.04                     # 질량 (40kg = 0.04 tonne)
+h0 = 300.0                      # 초기 높이 (mm)
+z_contact = 0.5                 # 충돌 기준 높이 (mm)
+
+rho = 1.225e-12                 # 공기 밀도 (tonne/mm^3)
+mu = 1.81e-11                   # 점성 계수 (tonne/mm*s)
+Cd = 1.05                       # 항력 계수
+g = 9810.0                      # 중력 가속도 (mm/s^2)
+dt = 0.0001                     # 시간 간격 (s)
+
+# 저항력 제한 설정 (100G 제한)
+G_limit = 100.0
+F_max_limit = mass * g * G_limit
+
+def run_simulation(mode):
+    """
+    mode 0: 자유 낙하
+    mode 1: 공기 저항만 추가
+    mode 2: 통합 모델 (공기저항 + 스퀴즈 효과 + 탈출동압 + 저항력제한)
+    """
+    t, z, v, a = 0.0, h0, 0.0, -g
+    res = {'t': [t], 'z': [z], 'v': [v], 'a': [a], 
+           'f_drag': [0], 'f_escape': [0], 'f_visc': [0], 'f_total': [0]}
+    
+    while z > z_contact:
+        # [안전장치 1] 수치 안정성을 위한 유효 높이 결정 (Overflow 방지)
+        h_eff = max(z, z_contact)
+        
+        f_drag, f_escape, f_visc, f_inert = 0.0, 0.0, 0.0, 0.0
+        
+        if mode >= 1:
+            f_drag = 0.5 * rho * Cd * A * v**2
+            
+        if mode == 2:
+            # [수식 1] 탈출 동압 저항 (1/h^2) - 1700mm/s 역전의 핵심
+            v_out = (A * abs(v)) / (P * h_eff)
+            f_escape = 0.5 * rho * (v_out**2) * A * 2.5 # 손실계수 2.5
+            
+            # [수식 2] 점성 저항 (1/h^3) - 최종 연착륙 유도
+            f_visc = (mu * L * W**3 / (h_eff**3)) * 0.42 * abs(v)
+            
+            # [수식 3] 부가질량 관성 저항 (1/h)
+            f_inert = (rho * L * W**3 / h_eff) * 0.2 * abs(a)
+            
+        # [안전장치 2] 저항력 클램핑 (물리적 한계 및 수치 발산 방지)
+        raw_f_total = f_drag + f_escape + f_visc + f_inert
+        f_clamped = min(raw_f_total, F_max_limit)
+        
+        # 운동 방정식
+        a_new = (-mass * g + f_clamped) / mass
+        
+        v += a_new * dt
+        z += v * dt
+        t += dt
+        a = a_new
+        
+        res['t'].append(t); res['z'].append(z); res['v'].append(v); res['a'].append(a)
+        res['f_drag'].append(f_drag); res['f_escape'].append(f_escape)
+        res['f_visc'].append(f_visc); res['f_total'].append(f_clamped)
+        
+        if t > 0.5: break # 안전 종료
+        
+    return res
+
+# 3가지 안 실행
+cases = [run_simulation(i) for i in range(3)]
+labels = ['Free Fall', 'Air Drag Only', 'Integrated Full Model']
+
+# --- 결과 시각화 ---
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# 1. 변위 (Position)
+for i, c in enumerate(cases):
+    axes[0,0].plot(c['t'], c['z'], label=labels[i], linestyle='--' if i<2 else '-')
+axes[0,0].set_title('Position [mm]', fontsize=14); axes[0,0].legend(); axes[0,0].grid(True, alpha=0.3)
+
+# 2. 속도 (Velocity) - 1700mm/s 역전 확인
+for i, c in enumerate(cases):
+    axes[0,1].plot(c['t'], c['v'], label=labels[i], linestyle='--' if i<2 else '-')
+axes[0,1].axhline(-1700, color='blue', ls=':', label='Target Inversion (-1700)')
+axes[0,1].set_title('Velocity [mm/s]', fontsize=14); axes[0,1].legend(); axes[0,1].grid(True, alpha=0.3)
+
+# 3. 가속도 (Acceleration) - 에어쿠션 피크 확인
+for i, c in enumerate(cases):
+    axes[1,0].plot(c['t'], c['a'], label=labels[i], linestyle='--' if i<2 else '-')
+axes[1,0].set_title('Acceleration [mm/s²]', fontsize=14); axes[1,0].legend(); axes[1,0].grid(True, alpha=0.3)
+
+# 4. 저항력 구성 성분 분석 (Case 2 - Log Scale)
+full = cases[2]
+axes[1,1].semilogy(full['t'], full['f_escape'], label='Escape Press (1/h²)', lw=2)
+axes[1,1].semilogy(full['t'], full['f_visc'], label='Viscous (1/h³)', lw=1.5, alpha=0.7)
+axes[1,1].semilogy(full['t'], full['f_total'], 'r', label='Total (Clamped 100G)', lw=1.5)
+axes[1,1].axhline(mass*g, color='k', ls='--', label='Weight (mg)')
+axes[1,1].set_title('Force Analysis [N] (Log Scale)', fontsize=14); axes[1,1].legend(); axes[1,1].grid(True, which='both', alpha=0.2)
+
+plt.tight_layout(); plt.show()
