@@ -102,3 +102,84 @@ ax_f.legend(loc='upper left'); ax_f.grid(True, which='both', alpha=0.2)
 
 plt.tight_layout()
 plt.show()
+
+
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- mm-tonne-s 단위계 ---
+L, W = 2000.0, 1200.0
+A = L * W
+P = 2 * (L + W)
+mass = 0.04
+h0 = 300.0
+rho = 1.225e-12
+mu = 1.81e-11
+g = 9810.0
+dt = 0.0001
+z_contact = 0.5  # 물리적 충돌로 간주하는 높이 (0.5mm)
+
+def simulate_to_impact(mode):
+    t, z, v, a = 0.0, h0, 0.0, -g
+    res = {'t': [t], 'z': [z], 'v': [v], 'a': [a], 'f_res': [0.0]}
+    
+    while z > z_contact:
+        h = max(z, z_contact) # Singularity 방지
+        f_drag = 0.5 * rho * 1.05 * A * v**2 if mode >= 1 else 0.0
+        
+        f_sq = 0.0
+        if mode == 2:
+            f_esc = 0.5 * rho * ((A * abs(v)) / (P * h))**2 * A * 2.5
+            f_vis = (mu * L * W**3 / h**3) * 0.42 * abs(v)
+            f_ine = (rho * L * W**3 / h) * 0.2 * abs(a)
+            f_sq = f_esc + f_vis + f_ine
+            
+        f_total = f_drag + f_sq
+        a_new = (-mass * g + f_total) / mass
+        
+        v += a_new * dt
+        z += v * dt
+        t += dt
+        a = a_new
+        
+        res['t'].append(t); res['z'].append(z); res['v'].append(v); res['a'].append(a)
+        res['f_res'].append(f_total)
+        
+    return res
+
+# 3가지 케이스 실행
+c0 = simulate_to_impact(0) # 자유 낙하
+c1 = simulate_to_impact(1) # 공기 저항
+c2 = simulate_to_impact(2) # 풀 모델 (스퀴즈 이펙트)
+
+# --- 결과 시각화 ---
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+# (1) 속도 프로파일: 충돌 속도 비교
+axes[0].plot(c0['t'], c0['v'], 'k--', label=f'Free Fall (Impact: {c0["v"][-1]:.1f} mm/s)')
+axes[0].plot(c1['t'], c1['v'], 'g--', label=f'Air Drag Only (Impact: {c1["v"][-1]:.1f} mm/s)')
+axes[0].plot(c2['t'], c2['v'], 'r-', linewidth=2, label=f'Full Model (Impact: {c2["v"][-1]:.1f} mm/s)')
+axes[0].axhline(-1700, color='blue', linestyle=':', label='Velocity Inversion (1700)')
+axes[0].set_title('Velocity Profile until Impact', fontsize=14)
+axes[0].set_ylabel('Velocity [mm/s]'); axes[0].set_xlabel('Time [s]')
+axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+# (2) 가속도 비교: 저항력의 폭발적 증가 확인
+axes[1].plot(c0['t'], c0['a'], 'k--', label='Free Fall')
+axes[1].plot(c2['t'], c2['a'], 'r-', linewidth=2, label='Full Model')
+axes[1].set_title('Acceleration Change (Cushioning Effect)', fontsize=14)
+axes[1].set_ylabel('Accel [mm/s²]'); axes[1].set_xlabel('Time [s]')
+axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print(f"충돌 직전 속도 비교:")
+print(f"- 자유 낙하: {abs(c0['v'][-1]):.2f} mm/s")
+print(f"- 풀 모델 적용: {abs(c2['v'][-1]):.2f} mm/s")
+
+
